@@ -65,7 +65,7 @@ class Settings:
     require_btc_align: bool = True
     allow_long: bool = True
     allow_short: bool = True
-    min_quote_vol_24h: float = 500_000
+    min_quote_vol_24h: float = 50_000
     session_start: int = 0
     session_end: int = 24
     max_signals_day: int = 8
@@ -120,7 +120,7 @@ class Settings:
             require_btc_align=_b("REQUIRE_BTC_ALIGN", "true"),
             allow_long=_b("ALLOW_LONG", "true"),
             allow_short=_b("ALLOW_SHORT", "true"),
-            min_quote_vol_24h=_f("MIN_QUOTE_VOL_24H", 500000),
+            min_quote_vol_24h=_f("MIN_QUOTE_VOL_24H", 50000),
             session_start=_i("SESSION_START", 0),
             session_end=_i("SESSION_END", 24),
             max_signals_day=_i("MAX_SIGNALS_DAY", 8),

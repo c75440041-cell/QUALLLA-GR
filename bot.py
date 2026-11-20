@@ -94,23 +94,98 @@ class State:
         self.save()
 
 
-async def universe(bx: BingX) -> list[str]:
-    tickers = await bx.swap_tickers()
-    q = settings.quote
-    rows: list[tuple[str, float]] = []
-    for t in tickers:
-        sym = (t.get("symbol") or "").upper()
-        if not sym.endswith(f"-{q}"):
+def _ticker_vol(t: dict) -> float:
+    """BingX usa claves distintas según endpoint/versión."""
+    for k in (
+        "quoteVolume",
+        "quoteVolume24h",
+        "turnover",
+        "turnover24h",
+        "volume24h",
+        "volume",
+        "vol",
+        "amount",
+    ):
+        v = t.get(k)
+        if v is None or v == "":
             continue
         try:
-            vol = float(t.get("quoteVolume") or t.get("volume") or 0)
+            f = float(v)
+            if f > 0:
+                return f
         except (TypeError, ValueError):
-            vol = 0.0
-        if vol < settings.min_quote_vol_24h:
             continue
+    return 0.0
+
+
+def _ticker_symbol(t: dict) -> str:
+    for k in ("symbol", "pair", "s"):
+        v = t.get(k)
+        if v:
+            return str(v).upper().replace("_", "-").replace("/", "-")
+    return ""
+
+
+async def universe(bx: BingX) -> list[str]:
+    tickers = await bx.swap_tickers()
+    if not tickers:
+        log.warning("ticker list vacía — revisa BingX API")
+        return []
+    # debug una sola vez por proceso
+    if not getattr(universe, "_logged_sample", False):
+        sample = tickers[0] if isinstance(tickers[0], dict) else {}
+        log.info("ticker sample keys=%s symbol=%s vol=%s", list(sample.keys())[:20], _ticker_symbol(sample), _ticker_vol(sample))
+        universe._logged_sample = True  # type: ignore
+
+    q = settings.quote
+    rows: list[tuple[str, float]] = []
+    skipped_quote = 0
+    skipped_vol = 0
+    for t in tickers:
+        if not isinstance(t, dict):
+            continue
+        sym = _ticker_symbol(t)
+        if not sym:
+            continue
+        # aceptar BTC-USDT o BTCUSDT
+        if sym.endswith(q) and not sym.endswith(f"-{q}"):
+            base = sym[: -len(q)]
+            sym = f"{base}-{q}"
+        if not sym.endswith(f"-{q}"):
+            skipped_quote += 1
+            continue
+        vol = _ticker_vol(t)
+        if vol < settings.min_quote_vol_24h:
+            skipped_vol += 1
+            # si vol siempre 0 por clave mal parseada, no descartar aún
+            if vol > 0:
+                continue
         rows.append((sym, vol))
+
+    # si el filtro de volumen dejó todo fuera pero había pares USDT, relajar
+    if not rows:
+        log.warning(
+            "universo vacío tras filtros (skip_quote=%s skip_vol=%s n_raw=%s) — relajando volumen",
+            skipped_quote,
+            skipped_vol,
+            len(tickers),
+        )
+        for t in tickers:
+            if not isinstance(t, dict):
+                continue
+            sym = _ticker_symbol(t)
+            if not sym:
+                continue
+            if sym.endswith(q) and not sym.endswith(f"-{q}"):
+                sym = f"{sym[:-len(q)]}-{q}"
+            if not sym.endswith(f"-{q}"):
+                continue
+            rows.append((sym, _ticker_vol(t)))
+
     rows.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in rows[: settings.max_symbols]]
+    out = [s for s, _ in rows[: settings.max_symbols]]
+    log.info("universo n=%s (raw=%s skip_quote=%s)", len(out), len(tickers), skipped_quote)
+    return out
 
 
 async def scan_one(

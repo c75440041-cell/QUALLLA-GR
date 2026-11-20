@@ -42,7 +42,13 @@ class BingX:
 
     async def swap_tickers(self) -> list[dict]:
         data = await self._get("/openApi/swap/v2/quote/ticker")
-        return data if isinstance(data, list) else []
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for k in ("tickers", "list", "symbols", "data"):
+                if isinstance(data.get(k), list):
+                    return data[k]
+        return []
 
     async def klines(self, symbol: str, interval: str = "4h", limit: int = 120) -> list[list]:
         data = await self._get(
