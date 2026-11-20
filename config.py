@@ -33,13 +33,14 @@ class Settings:
     workers: int = 14
     tf_struct: str = "4h"   # estructura tipo daily
     tf_entry: str = "15m"   # trigger tipo opening range
-    kline_limit: int = 120
+    # Debe ser >= mom_bars_long + margen, si no el momentum 30d no se calcula.
+    kline_limit: int = 220
 
     # Momentum scan (estilo top 1-2%)
     mom_bars_short: int = 42   # ~7d en 4h
     mom_bars_long: int = 180   # ~30d en 4h
-    top_pct: float = 0.08      # top 8% por momentum (crypto más ruidoso que stocks)
-    min_mom_pct: float = 18.0  # mínimo % en ventana corta para ser "leader"
+    top_pct: float = 0.08      # top 8% por momentum (mínimo 30 leaders)
+    min_mom_pct: float = 18.0  # reservado (no se usa como filtro duro)
 
     # Breakout Qulla-like
     prior_min_pct: float = 25.0
@@ -61,6 +62,23 @@ class Settings:
     bb_len: int = 20
     squeeze_pct: float = 25.0  # percentil ancho BB bajo = comprimido
 
+    # Funding (perps). Valores como fracción: 0.0001 = 0.01% = 1 bps
+    use_funding_filter: bool = True
+    # LONG bloqueado si funding > este valor (largos saturados)
+    funding_long_max: float = 0.0005    # 0.05%
+    # SHORT bloqueado si funding < este valor (cortos saturados → riesgo de squeeze)
+    funding_short_min: float = -0.0001  # permite ligeramente negativo
+    # Funding >= esto suma score al SHORT; <= -esto suma score al LONG
+    funding_short_boost: float = 0.0003
+    # Crowding extremo: bloquea el lado saturado aunque el promedio sea normal
+    funding_extreme: float = 0.001      # 0.10%
+    use_funding_avg: bool = True        # usa media de ~21 pagos (≈7d a 8h)
+
+    # Open interest: ajusta score según Δ% de OI (no bloquea)
+    use_oi_filter: bool = True
+    oi_lookback_min: int = 240          # ventana para Δ% (4h, igual que la estructura)
+    oi_state_path: str = "/data/oi_cache.json"
+
     # Filtros
     require_btc_align: bool = True
     allow_long: bool = True
@@ -69,7 +87,7 @@ class Settings:
     session_start: int = 0
     session_end: int = 24
     max_signals_day: int = 8
-    cooldown_bars: int = 1  # no repetir mismo par+side el mismo día
+    cooldown_bars: int = 1  # reservado: hoy se dedupe par+lado por día
 
     # Riesgo
     risk_pct: float = 0.5
@@ -90,6 +108,13 @@ class Settings:
         mode = os.getenv("MODE", "SIGNAL").strip().upper()
         if mode not in {"SIGNAL", "PAPER", "LIVE"}:
             mode = "SIGNAL"
+
+        mom_bars_short = _i("MOM_BARS_SHORT", 42)
+        mom_bars_long = _i("MOM_BARS_LONG", 180)
+        # Aunque en Railway quede KLINE_LIMIT=120, forzamos velas suficientes
+        # para el momentum largo (antes daba 0.0 siempre).
+        kline_limit = max(_i("KLINE_LIMIT", 220), mom_bars_long + 20, mom_bars_short + 20)
+
         return cls(
             mode=mode,
             quote=os.getenv("QUOTE", "USDT").strip().upper(),
@@ -98,9 +123,9 @@ class Settings:
             workers=max(2, min(32, _i("WORKERS", 14))),
             tf_struct=os.getenv("TF_STRUCT", "4h"),
             tf_entry=os.getenv("TF_ENTRY", "15m"),
-            kline_limit=_i("KLINE_LIMIT", 120),
-            mom_bars_short=_i("MOM_BARS_SHORT", 42),
-            mom_bars_long=_i("MOM_BARS_LONG", 180),
+            kline_limit=kline_limit,
+            mom_bars_short=mom_bars_short,
+            mom_bars_long=mom_bars_long,
             top_pct=_f("TOP_PCT", 0.08),
             min_mom_pct=_f("MIN_MOM_PCT", 18.0),
             prior_min_pct=_f("PRIOR_MIN_PCT", 25.0),
@@ -117,6 +142,15 @@ class Settings:
             use_squeeze=_b("USE_SQUEEZE", "true"),
             bb_len=_i("BB_LEN", 20),
             squeeze_pct=_f("SQUEEZE_PCT", 25.0),
+            use_funding_filter=_b("USE_FUNDING_FILTER", "true"),
+            funding_long_max=_f("FUNDING_LONG_MAX", 0.0005),
+            funding_short_min=_f("FUNDING_SHORT_MIN", -0.0001),
+            funding_short_boost=_f("FUNDING_SHORT_BOOST", 0.0003),
+            funding_extreme=_f("FUNDING_EXTREME", 0.001),
+            use_funding_avg=_b("USE_FUNDING_AVG", "true"),
+            use_oi_filter=_b("USE_OI_FILTER", "true"),
+            oi_lookback_min=max(60, _i("OI_LOOKBACK_MIN", 240)),
+            oi_state_path=os.getenv("OI_STATE_PATH", "/data/oi_cache.json"),
             require_btc_align=_b("REQUIRE_BTC_ALIGN", "true"),
             allow_long=_b("ALLOW_LONG", "true"),
             allow_short=_b("ALLOW_SHORT", "true"),

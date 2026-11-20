@@ -50,17 +50,22 @@ def _load(path: str) -> dict:
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text())
+        data = json.loads(p.read_text())
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
 def _save(path: str, data: dict) -> None:
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2))
-    tmp.replace(p)
+    """Guarda JSON de forma atómica. Si /data no es escribible solo avisa (no tumba el bot)."""
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(p)
+    except Exception as e:
+        log.warning("no pude guardar %s: %s", path, e)
 
 
 class State:
@@ -92,6 +97,67 @@ class State:
         self.data.setdefault("seen", {})[self.key(symbol, side)] = time.time()
         self.data["signals_today"] = int(self.data.get("signals_today", 0)) + 1
         self.save()
+
+
+class OICache:
+    """Histórico de OI por símbolo ({sym: [[ts, oi], ...]}) para calcular Δ% en una ventana real.
+
+    Antes solo se comparaba contra el ciclo anterior (~3 min), que es ruido puro; los umbrales
+    del filtro (+8% / -12%) están pensados para horas, no para minutos.
+    """
+
+    SPACING_S = 600  # una muestra cada ≥10 min por símbolo
+
+    def __init__(self, path: str, lookback_min: int):
+        self.path = path
+        self.lookback_s = lookback_min * 60
+        self.keep_s = max(8 * 3600, int(self.lookback_s * 1.5))
+        self.min_age_s = 3600  # no calcular Δ con muestras de <1h
+        self.data: dict[str, list[list[float]]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        raw = _load(self.path)
+        for sym, hist in raw.items():
+            # formato viejo ({sym: float}) o corrupto → se descarta
+            if not isinstance(hist, list):
+                continue
+            clean = [
+                [float(h[0]), float(h[1])]
+                for h in hist
+                if isinstance(h, (list, tuple)) and len(h) == 2
+            ]
+            if clean:
+                self.data[sym] = clean
+
+    def save(self) -> None:
+        _save(self.path, self.data)
+
+    def delta_pct(self, sym: str, oi: float | None, now: float) -> float | None:
+        """Δ% del OI actual vs la muestra más cercana a `lookback` (con edad ≥ 1h)."""
+        if oi is None:
+            return None
+        old = [h for h in self.data.get(sym, []) if now - h[0] >= self.min_age_s]
+        if not old:
+            return None
+        target = now - self.lookback_s
+        ref = min(old, key=lambda h: abs(h[0] - target))
+        if ref[1] <= 0:
+            return None
+        return 100.0 * (oi - ref[1]) / ref[1]
+
+    def record(self, sym: str, oi: float | None, now: float) -> None:
+        if oi is None or oi <= 0:
+            return
+        hist = self.data.setdefault(sym, [])
+        if not hist or now - hist[-1][0] >= self.SPACING_S:
+            hist.append([now, oi])
+        cutoff = now - self.keep_s
+        self.data[sym] = [h for h in hist if h[0] >= cutoff]
+
+    def prune(self, now: float) -> None:
+        cutoff = now - self.keep_s
+        self.data = {s: h for s, h in self.data.items() if h and h[-1][0] >= cutoff}
 
 
 def _ticker_vol(t: dict) -> float:
@@ -182,19 +248,89 @@ async def universe(bx: BingX) -> list[str]:
     return out
 
 
+def apply_funding_filter(
+    sig: Signal,
+    last_fr: float | None,
+    avg_fr: float | None = None,
+    oi: float | None = None,
+    oi_chg_pct: float | None = None,
+) -> Signal | None:
+    """Bloquea/puntúa con funding (last + media ~7d) y Δ% de OI. None = señal descartada."""
+    sig.funding = last_fr
+    sig.funding_avg = avg_fr
+    sig.oi = oi
+    sig.oi_chg_pct = oi_chg_pct
+
+    if not settings.use_funding_filter:
+        return sig
+
+    fr = avg_fr if (settings.use_funding_avg and avg_fr is not None) else last_fr
+    if fr is None:
+        sig.note = (sig.note + " · fund n/a").strip(" ·")
+        return sig
+
+    bps = fr * 10_000
+    use_oi = settings.use_oi_filter and oi_chg_pct is not None
+
+    if sig.side == "LONG":
+        # largos saturados: funding medio alto, o último print en crowding extremo
+        if fr > settings.funding_long_max:
+            return None
+        if last_fr is not None and last_fr > settings.funding_extreme:
+            return None
+        # OI subiendo + funding positivo = más frágil
+        if use_oi and oi_chg_pct > 8 and fr > 0:
+            sig.score = max(0, sig.score - 8)
+            sig.note = (sig.note + f" · OI+{oi_chg_pct:.0f}% crowded").strip(" ·")
+        # funding negativo (cortos pagan) = combustible para el breakout
+        if fr <= -settings.funding_short_boost:
+            sig.score = min(100, sig.score + 8)
+            sig.note = (sig.note + f" · fundAvg {bps:.1f}bps ok+").strip(" ·")
+        else:
+            sig.note = (sig.note + f" · fundAvg {bps:.1f}bps").strip(" ·")
+    else:  # SHORT
+        # cortos saturados → riesgo de short squeeze
+        if fr < settings.funding_short_min:
+            return None
+        if last_fr is not None and last_fr < -settings.funding_extreme:
+            return None
+        if fr >= settings.funding_short_boost:
+            sig.score = min(100, sig.score + 10)
+            sig.note = (sig.note + f" · fundAvg {bps:.1f}bps SHORT+").strip(" ·")
+        elif fr >= 0:
+            sig.score = min(100, sig.score + 4)
+            sig.note = (sig.note + f" · fundAvg {bps:.1f}bps").strip(" ·")
+        else:
+            sig.note = (sig.note + f" · fundAvg {bps:.1f}bps").strip(" ·")
+        # OI subiendo con funding + = más longs que liquidar en el crack
+        if use_oi and oi_chg_pct > 5 and fr > 0:
+            sig.score = min(100, sig.score + 6)
+            sig.note = (sig.note + f" · OI+{oi_chg_pct:.0f}%").strip(" ·")
+        # OI cayendo fuerte: ya hubo deleveraging
+        if use_oi and oi_chg_pct < -12:
+            sig.score = max(0, sig.score - 5)
+            sig.note = (sig.note + f" · OI{oi_chg_pct:.0f}%").strip(" ·")
+
+    return sig
+
+
 async def scan_one(
     bx: BingX,
     symbol: str,
     btc_reg: str,
+    kl_s: list[list],
     sem: asyncio.Semaphore,
-) -> Signal | None:
+) -> list[Signal]:
+    """Devuelve TODOS los setups del símbolo (ordenados por score).
+
+    kl_s son las velas de estructura ya descargadas en el ranking (antes se pedían dos veces).
+    """
     async with sem:
         try:
-            kl_s = await bx.klines(symbol, settings.tf_struct, settings.kline_limit)
             kl_e = await bx.klines(symbol, settings.tf_entry, min(120, settings.kline_limit))
         except Exception as e:
-            log.debug("%s klines: %s", symbol, e)
-            return None
+            log.debug("%s klines entry: %s", symbol, e)
+            return []
 
     mom_s, mom_l = momentum_rank(kl_s, settings.mom_bars_short, settings.mom_bars_long)
     candidates: list[Signal] = []
@@ -264,16 +400,14 @@ async def scan_one(
         if sig:
             candidates.append(sig)
 
-    if not candidates:
-        return None
+    for c in candidates:
+        c.btc_regime = btc_reg
+        c.tf = settings.tf_entry
     candidates.sort(key=lambda x: x.score, reverse=True)
-    best = candidates[0]
-    best.btc_regime = btc_reg
-    best.tf = settings.tf_entry
-    return best
+    return candidates
 
 
-async def run_cycle(bx: BingX, state: State) -> dict[str, Any]:
+async def run_cycle(bx: BingX, state: State, oi_cache: OICache) -> dict[str, Any]:
     t0 = time.time()
     if not _in_session():
         return {"n_sym": 0, "cycle_s": 0, "skipped": "session", "hour": _utc_hour()}
@@ -282,56 +416,119 @@ async def run_cycle(bx: BingX, state: State) -> dict[str, Any]:
         return {"n_sym": 0, "cycle_s": 0, "skipped": "max_signals"}
 
     symbols = await universe(bx)
+    if not symbols:
+        return {"n_sym": 0, "cycle_s": time.time() - t0, "skipped": "no_universe"}
+
     try:
         btc_kl = await bx.klines(f"BTC-{settings.quote}", settings.tf_struct, 100)
         reg = btc_regime(btc_kl)
     except Exception:
         reg = "unknown"
 
-    # pre-rank leaders by |momentum| (incluye caídas fuertes para SHORT)
+    # 1) velas de estructura de todo el universo (se reutilizan en el scan)
     sem = asyncio.Semaphore(settings.workers)
-    mom_list: list[tuple[str, float, float]] = []
+    kl_struct: dict[str, list[list]] = {}
 
-    async def _mom(sym: str) -> None:
+    async def _fetch_struct(sym: str) -> None:
         async with sem:
             try:
                 kl = await bx.klines(sym, settings.tf_struct, settings.kline_limit)
-            except Exception:
+            except Exception as e:
+                log.debug("%s klines struct: %s", sym, e)
                 return
-        if not kl or len(kl) < 10:
-            return
+        if kl and len(kl) >= 10:
+            kl_struct[sym] = kl
+
+    await asyncio.gather(*[_fetch_struct(s) for s in symbols])
+    if not kl_struct:
+        log.warning("klines vacías para todo el universo — API caída o rate limit")
+        return {"n_sym": len(symbols), "cycle_s": time.time() - t0, "skipped": "no_klines"}
+
+    # 2) ranking por |momentum| (incluye caídas fuertes para SHORT)
+    mom_list: list[tuple[str, float, float]] = []
+    for sym, kl in kl_struct.items():
         ms, ml = momentum_rank(kl, settings.mom_bars_short, settings.mom_bars_long)
         mom_list.append((sym, ms, ml))
-
-    await asyncio.gather(*[_mom(s) for s in symbols])
-    if not mom_list:
-        log.warning("momentum vacío — klines sin datos útiles; usando top símbolos por orden de universo")
-        leaders = list(symbols[: max(30, int(len(symbols) * settings.top_pct))])
-    else:
-        mom_list.sort(key=lambda x: (abs(x[1]), abs(x[2])), reverse=True)
-        # log muestra
-        top3 = mom_list[:3]
-        log.info(
-            "momentum sample n=%s top=%s",
-            len(mom_list),
-            [(s, round(a, 1), round(b, 1)) for s, a, b in top3],
-        )
-        n_keep = max(30, int(len(symbols) * max(settings.top_pct, 0.12)))
-        # no exigir min_mom para entrar al ranking; el min se usa solo como boost
-        leaders = [x[0] for x in mom_list[:n_keep]]
-
-    funnel = {"leaders": len(leaders), "setups": 0, "sent": 0}
-    signals: list[Signal] = []
-    results = await asyncio.gather(
-        *[scan_one(bx, s, reg, sem) for s in leaders],
-        return_exceptions=True,
+    mom_list.sort(key=lambda x: (abs(x[1]), abs(x[2])), reverse=True)
+    log.info(
+        "momentum sample n=%s top=%s",
+        len(mom_list),
+        [(s, round(float(a), 1), round(float(b), 1)) for s, a, b in mom_list[:3]],
     )
-    for r in results:
-        if isinstance(r, Signal):
-            signals.append(r)
+    n_keep = max(30, int(len(symbols) * settings.top_pct))
+    leaders = [x[0] for x in mom_list[:n_keep]]
+
+    # 3) scan de leaders + snapshot de OI en paralelo
+    async def _oi_now() -> dict[str, float]:
+        if not settings.use_oi_filter:
+            return {}
+        try:
+            return await bx.oi_map(leaders, workers=min(10, settings.workers))
+        except Exception as e:
+            log.warning("oi_map falló: %s", e)
+            return {}
+
+    scan_res, oi_now = await asyncio.gather(
+        asyncio.gather(
+            *[scan_one(bx, s, reg, kl_struct[s], sem) for s in leaders],
+            return_exceptions=True,
+        ),
+        _oi_now(),
+    )
+
+    cand_by_sym: dict[str, list[Signal]] = {}
+    for sym, r in zip(leaders, scan_res):
+        if isinstance(r, BaseException):
+            log.debug("scan %s: %r", sym, r)
+            continue
+        if r:
+            cand_by_sym[sym] = r
+
+    # 4) funding SOLO de los símbolos con setup (antes se pedía de todos los leaders)
+    fund: dict[str, dict] = {}
+    if settings.use_funding_filter and cand_by_sym:
+        try:
+            fund = await bx.funding_map(list(cand_by_sym), workers=min(8, settings.workers))
+        except Exception as e:
+            log.warning("funding_map falló: %s", e)
+        log.info("funding n=%s/%s sample=%s", len(fund), len(cand_by_sym), list(fund.items())[:2])
+
+    # 5) filtros: por símbolo se queda el mejor setup que sobreviva
+    now = time.time()
+    funnel = {
+        "leaders": len(leaders),
+        "candidates": sum(len(v) for v in cand_by_sym.values()),
+        "fund_skip": 0,
+        "setups": 0,
+        "sent": 0,
+    }
+    signals: list[Signal] = []
+    for sym, cands in cand_by_sym.items():
+        info = fund.get(sym) or {}
+        oi = oi_now.get(sym)
+        oi_chg = oi_cache.delta_pct(sym, oi, now) if settings.use_oi_filter else None
+        survivors: list[Signal] = []
+        for c in cands:
+            f = apply_funding_filter(c, info.get("last"), info.get("avg"), oi, oi_chg)
+            if f is None:
+                funnel["fund_skip"] += 1
+            else:
+                survivors.append(f)
+        if survivors:
+            survivors.sort(key=lambda x: x.score, reverse=True)
+            signals.append(survivors[0])
             funnel["setups"] += 1
     signals.sort(key=lambda x: x.score, reverse=True)
 
+    # snapshots de OI de todos los leaders (para tener histórico en próximos ciclos)
+    if settings.use_oi_filter:
+        for sym, oi in oi_now.items():
+            oi_cache.record(sym, oi, now)
+        oi_cache.prune(now)
+        oi_cache.save()
+
+    # 6) envío
+    tg_configured = bool(settings.telegram_token and settings.telegram_chat_id)
     for sig in signals:
         if state.already(sig.symbol, sig.side):
             continue
@@ -356,12 +553,19 @@ async def run_cycle(bx: BingX, state: State) -> dict[str, Any]:
             "tf": sig.tf,
             "mode": settings.mode,
             "note": sig.note,
+            "funding": None if sig.funding is None else round(sig.funding * 10000, 2),
+            "funding_avg": None if sig.funding_avg is None else round(sig.funding_avg * 10000, 2),
+            "oi_chg_pct": None if sig.oi_chg_pct is None else round(sig.oi_chg_pct, 1),
         }
-        await send_telegram(
+        ok = await send_telegram(
             settings.telegram_token,
             settings.telegram_chat_id,
             format_signal(payload),
         )
+        if not ok and tg_configured:
+            # no se marca como vista: se reintenta en el próximo ciclo
+            log.warning("Telegram falló para %s %s; reintento próximo ciclo", sig.symbol, sig.side)
+            continue
         state.mark(sig.symbol, sig.side)
         funnel["sent"] += 1
         log.info("SIGNAL %s %s %s score=%s", sig.setup, sig.side, sig.symbol, sig.score)
@@ -383,16 +587,18 @@ async def run_cycle(bx: BingX, state: State) -> dict[str, Any]:
 
 async def main() -> None:
     log.info(
-        "Qulla Explosion MODE=%s TF=%s/%s TOP=%.0f%% session=%s-%s",
+        "Qulla Explosion MODE=%s TF=%s/%s TOP=%.0f%% session=%s-%s klines=%s",
         settings.mode,
         settings.tf_struct,
         settings.tf_entry,
         settings.top_pct * 100,
         settings.session_start,
         settings.session_end,
+        settings.kline_limit,
     )
     bx = BingX(settings.bingx_api_key, settings.bingx_api_secret)
     state = State()
+    oi_cache = OICache(settings.oi_state_path, settings.oi_lookback_min)
     await send_telegram(
         settings.telegram_token,
         settings.telegram_chat_id,
@@ -410,7 +616,7 @@ async def main() -> None:
         while True:
             state._roll()
             try:
-                info = await run_cycle(bx, state)
+                info = await run_cycle(bx, state, oi_cache)
                 log.info("ciclo %s", info)
                 n += 1
                 if n % hb_every == 0:

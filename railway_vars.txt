@@ -2,6 +2,9 @@
 # Qulla Explosion Bot — variables Railway
 # ═══════════════════════════════════════════════════
 
+# Fija Python (evita el fallo de mise con python@3.11.9 sin attestations)
+RAILPACK_PYTHON_VERSION=3.12
+
 MODE=SIGNAL
 
 TELEGRAM_TOKEN=
@@ -16,7 +19,8 @@ SCAN_SEC=180
 WORKERS=14
 TF_STRUCT=4h
 TF_ENTRY=15m
-KLINE_LIMIT=120
+# Debe ser >= MOM_BARS_LONG + 20 (el código lo fuerza igualmente)
+KLINE_LIMIT=220
 
 # Momentum leaders (estilo Qulla top %)
 MOM_BARS_SHORT=42
@@ -62,3 +66,16 @@ MAX_LOSS_STREAK=3
 MAX_DAY_LOSS_PCT=2.5
 
 STATE_PATH=/data/state.json
+
+# Funding filter (perps) — fracciones: 0.0001 = 0.01% = 1 bps
+USE_FUNDING_FILTER=true
+FUNDING_LONG_MAX=0.0005
+FUNDING_SHORT_MIN=-0.0001
+FUNDING_SHORT_BOOST=0.0003
+FUNDING_EXTREME=0.001
+USE_FUNDING_AVG=true
+
+# Open interest (ajusta score, no bloquea)
+USE_OI_FILTER=true
+OI_LOOKBACK_MIN=240
+OI_STATE_PATH=/data/oi_cache.json

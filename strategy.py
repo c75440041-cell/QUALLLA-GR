@@ -30,6 +30,10 @@ class Signal:
     note: str
     btc_regime: str = ""
     tf: str = "15m"
+    funding: float | None = None
+    funding_avg: float | None = None
+    oi: float | None = None
+    oi_chg_pct: float | None = None
 
 
 def _ema(x: np.ndarray, n: int) -> np.ndarray:
@@ -69,7 +73,9 @@ def _ret_pct(c: np.ndarray, bars: int) -> float:
 
 
 def momentum_rank(ohlcv: list[list], bars_s: int, bars_l: int) -> tuple[float, float]:
-    if len(ohlcv) < max(bars_s, bars_l) + 2:
+    """Retorno % corto y largo. Solo exige velas para la ventana corta;
+    la larga se recorta a lo disponible (_ret_pct) en vez de devolver 0."""
+    if len(ohlcv) < bars_s + 2:
         return 0.0, 0.0
     c = np.array([x[4] for x in ohlcv], dtype=float)
     return _ret_pct(c, bars_s), _ret_pct(c, bars_l)
