@@ -93,7 +93,7 @@ class Settings:
         return cls(
             mode=mode,
             quote=os.getenv("QUOTE", "USDT").strip().upper(),
-            max_symbols=_i("MAX_SYMBOLS", 180),
+            max_symbols=max(20, _i("MAX_SYMBOLS", 180)),
             scan_sec=max(60, _i("SCAN_SEC", 180)),
             workers=max(2, min(32, _i("WORKERS", 14))),
             tf_struct=os.getenv("TF_STRUCT", "4h"),
