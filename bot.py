@@ -1,0 +1,355 @@
+"""
+Qulla Explosion Bot — BingX USDT-M perps
+Escanea líderes (momentum), detecta BREAKOUT / PARABOLIC / SQUEEZE.
+MODE=SIGNAL por defecto (Telegram). LIVE opcional con keys.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from bingx import BingX
+from config import settings
+from notify import format_heartbeat, format_signal, send_telegram
+from strategy import (
+    Signal,
+    btc_regime,
+    detect_breakout_long,
+    detect_parabolic_short,
+    detect_squeeze_break,
+    momentum_rank,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("bot")
+
+
+def _utc_hour() -> int:
+    return datetime.now(timezone.utc).hour
+
+
+def _day_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _in_session() -> bool:
+    h = _utc_hour()
+    return settings.session_start <= h < settings.session_end
+
+
+def _load(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {}
+
+
+def _save(path: str, data: dict) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(p)
+
+
+class State:
+    def __init__(self) -> None:
+        self.data = _load(settings.state_path)
+        self._roll()
+
+    def _roll(self) -> None:
+        d = _day_key()
+        if self.data.get("day") != d:
+            self.data = {
+                "day": d,
+                "signals_today": 0,
+                "seen": {},
+                "loss_streak": 0,
+            }
+            self.save()
+
+    def save(self) -> None:
+        _save(settings.state_path, self.data)
+
+    def key(self, symbol: str, side: str) -> str:
+        return f"{symbol}:{side}:{_day_key()}"
+
+    def already(self, symbol: str, side: str) -> bool:
+        return self.key(symbol, side) in self.data.get("seen", {})
+
+    def mark(self, symbol: str, side: str) -> None:
+        self.data.setdefault("seen", {})[self.key(symbol, side)] = time.time()
+        self.data["signals_today"] = int(self.data.get("signals_today", 0)) + 1
+        self.save()
+
+
+async def universe(bx: BingX) -> list[str]:
+    tickers = await bx.swap_tickers()
+    q = settings.quote
+    rows: list[tuple[str, float]] = []
+    for t in tickers:
+        sym = (t.get("symbol") or "").upper()
+        if not sym.endswith(f"-{q}"):
+            continue
+        try:
+            vol = float(t.get("quoteVolume") or t.get("volume") or 0)
+        except (TypeError, ValueError):
+            vol = 0.0
+        if vol < settings.min_quote_vol_24h:
+            continue
+        rows.append((sym, vol))
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in rows[: settings.max_symbols]]
+
+
+async def scan_one(
+    bx: BingX,
+    symbol: str,
+    btc_reg: str,
+    sem: asyncio.Semaphore,
+) -> Signal | None:
+    async with sem:
+        try:
+            kl_s = await bx.klines(symbol, settings.tf_struct, settings.kline_limit)
+            kl_e = await bx.klines(symbol, settings.tf_entry, min(120, settings.kline_limit))
+        except Exception as e:
+            log.debug("%s klines: %s", symbol, e)
+            return None
+
+    mom_s, mom_l = momentum_rank(kl_s, settings.mom_bars_short, settings.mom_bars_long)
+    candidates: list[Signal] = []
+
+    allow_l = settings.allow_long and (
+        not settings.require_btc_align or btc_reg in ("bull", "range", "unknown")
+    )
+    allow_s = settings.allow_short and (
+        not settings.require_btc_align or btc_reg in ("bear", "range", "unknown")
+    )
+
+    if allow_l:
+        sig = detect_breakout_long(
+            symbol,
+            kl_s,
+            kl_e,
+            prior_min_pct=settings.prior_min_pct,
+            base_bars=settings.base_bars,
+            base_max_width_atr=settings.base_max_width_atr,
+            break_buf_atr=settings.break_buf_atr,
+            rvol_min=settings.rvol_min,
+            rvol_len=settings.rvol_len,
+            ema_fast=settings.ema_fast,
+            ema_slow=settings.ema_slow,
+            sl_atr=settings.sl_atr,
+            tp_r=settings.tp_r,
+            mom_s=mom_s,
+            mom_l=mom_l,
+        )
+        if sig:
+            candidates.append(sig)
+
+    if allow_s:
+        sig = detect_parabolic_short(
+            symbol,
+            kl_s,
+            kl_e,
+            para_up_days=settings.para_up_days,
+            para_ext_atr=settings.para_ext_atr,
+            para_min_mom=settings.para_min_mom,
+            rvol_min=settings.rvol_min,
+            rvol_len=settings.rvol_len,
+            sl_atr=settings.sl_atr,
+            tp_r=settings.tp_r,
+            mom_s=mom_s,
+            mom_l=mom_l,
+        )
+        if sig:
+            candidates.append(sig)
+
+    if settings.use_squeeze:
+        sig = detect_squeeze_break(
+            symbol,
+            kl_e,
+            bb_len=settings.bb_len,
+            squeeze_pct=settings.squeeze_pct,
+            rvol_min=settings.rvol_min,
+            rvol_len=settings.rvol_len,
+            break_buf_atr=settings.break_buf_atr,
+            sl_atr=settings.sl_atr,
+            tp_r=settings.tp_r,
+            mom_s=mom_s,
+            mom_l=mom_l,
+            allow_long=allow_l,
+            allow_short=allow_s,
+        )
+        if sig:
+            candidates.append(sig)
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x.score, reverse=True)
+    best = candidates[0]
+    best.btc_regime = btc_reg
+    best.tf = settings.tf_entry
+    return best
+
+
+async def run_cycle(bx: BingX, state: State) -> dict[str, Any]:
+    t0 = time.time()
+    if not _in_session():
+        return {"n_sym": 0, "cycle_s": 0, "skipped": "session", "hour": _utc_hour()}
+
+    if state.data.get("signals_today", 0) >= settings.max_signals_day:
+        return {"n_sym": 0, "cycle_s": 0, "skipped": "max_signals"}
+
+    symbols = await universe(bx)
+    try:
+        btc_kl = await bx.klines(f"BTC-{settings.quote}", settings.tf_struct, 100)
+        reg = btc_regime(btc_kl)
+    except Exception:
+        reg = "unknown"
+
+    # pre-rank leaders by momentum (cheap pass with struct TF)
+    sem = asyncio.Semaphore(settings.workers)
+    mom_list: list[tuple[str, float, float]] = []
+
+    async def _mom(sym: str) -> None:
+        async with sem:
+            try:
+                kl = await bx.klines(sym, settings.tf_struct, settings.kline_limit)
+            except Exception:
+                return
+        ms, ml = momentum_rank(kl, settings.mom_bars_short, settings.mom_bars_long)
+        if ms >= settings.min_mom_pct * 0.5 or abs(ms) >= settings.min_mom_pct * 0.6:
+            mom_list.append((sym, ms, ml))
+
+    await asyncio.gather(*[_mom(s) for s in symbols])
+    # top by abs short momentum then long
+    mom_list.sort(key=lambda x: (abs(x[1]), abs(x[2])), reverse=True)
+    n_keep = max(20, int(len(symbols) * settings.top_pct))
+    leaders = [x[0] for x in mom_list[:n_keep]]
+    # always include strong absolute movers even if negative (for shorts)
+    for sym, ms, ml in mom_list:
+        if abs(ms) >= settings.min_mom_pct and sym not in leaders:
+            leaders.append(sym)
+        if len(leaders) >= n_keep + 15:
+            break
+
+    funnel = {"leaders": len(leaders), "setups": 0, "sent": 0}
+    signals: list[Signal] = []
+    results = await asyncio.gather(
+        *[scan_one(bx, s, reg, sem) for s in leaders],
+        return_exceptions=True,
+    )
+    for r in results:
+        if isinstance(r, Signal):
+            signals.append(r)
+            funnel["setups"] += 1
+    signals.sort(key=lambda x: x.score, reverse=True)
+
+    for sig in signals:
+        if state.already(sig.symbol, sig.side):
+            continue
+        if state.data.get("signals_today", 0) >= settings.max_signals_day:
+            break
+        if sig.score < 55:
+            continue
+        payload = {
+            "symbol": sig.symbol,
+            "side": sig.side,
+            "setup": sig.setup,
+            "score": sig.score,
+            "entry": round(sig.entry, 8),
+            "sl": round(sig.sl, 8),
+            "tp": round(sig.tp, 8),
+            "tp_r": sig.tp_r,
+            "mom_s": sig.mom_s,
+            "mom_l": sig.mom_l,
+            "rvol": sig.rvol,
+            "base_w": round(sig.base_w, 2),
+            "btc_regime": sig.btc_regime,
+            "tf": sig.tf,
+            "mode": settings.mode,
+            "note": sig.note,
+        }
+        await send_telegram(
+            settings.telegram_token,
+            settings.telegram_chat_id,
+            format_signal(payload),
+        )
+        state.mark(sig.symbol, sig.side)
+        funnel["sent"] += 1
+        log.info("SIGNAL %s %s %s score=%s", sig.setup, sig.side, sig.symbol, sig.score)
+
+        if settings.mode == "LIVE" and settings.bingx_api_key:
+            log.warning("LIVE: implementa qty segura antes de enviar órdenes reales")
+
+    return {
+        "n_sym": len(symbols),
+        "n_leaders": len(leaders),
+        "cycle_s": time.time() - t0,
+        "signals_today": state.data.get("signals_today", 0),
+        "mode": settings.mode,
+        "session": f"{settings.session_start}-{settings.session_end}",
+        "btc_regime": reg,
+        "funnel": funnel,
+    }
+
+
+async def main() -> None:
+    log.info(
+        "Qulla Explosion MODE=%s TF=%s/%s TOP=%.0f%% session=%s-%s",
+        settings.mode,
+        settings.tf_struct,
+        settings.tf_entry,
+        settings.top_pct * 100,
+        settings.session_start,
+        settings.session_end,
+    )
+    bx = BingX(settings.bingx_api_key, settings.bingx_api_secret)
+    state = State()
+    await send_telegram(
+        settings.telegram_token,
+        settings.telegram_chat_id,
+        (
+            f"🚀 <b>Qulla Explosion arrancado</b>\n"
+            f"MODE={settings.mode} · {settings.tf_struct}/{settings.tf_entry}\n"
+            f"Sesión {settings.session_start}-{settings.session_end} UTC\n"
+            f"Long={settings.allow_long} Short={settings.allow_short}\n"
+            f"Scan cada {settings.scan_sec}s · max {settings.max_signals_day}/día"
+        ),
+    )
+    n = 0
+    hb_every = max(1, int(1800 / max(settings.scan_sec, 60)))
+    try:
+        while True:
+            state._roll()
+            try:
+                info = await run_cycle(bx, state)
+                log.info("ciclo %s", info)
+                n += 1
+                if n % hb_every == 0:
+                    await send_telegram(
+                        settings.telegram_token,
+                        settings.telegram_chat_id,
+                        format_heartbeat(info),
+                    )
+            except Exception:
+                log.exception("ciclo error")
+            await asyncio.sleep(settings.scan_sec)
+    finally:
+        await bx.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

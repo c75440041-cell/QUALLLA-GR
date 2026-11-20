@@ -1,0 +1,64 @@
+# ═══════════════════════════════════════════════════
+# Qulla Explosion Bot — variables Railway
+# ═══════════════════════════════════════════════════
+
+MODE=SIGNAL
+
+TELEGRAM_TOKEN=
+TELEGRAM_CHAT_ID=
+
+BINGX_API_KEY=
+BINGX_API_SECRET=
+
+QUOTE=USDT
+MAX_SYMBOLS=180
+SCAN_SEC=180
+WORKERS=14
+TF_STRUCT=4h
+TF_ENTRY=15m
+KLINE_LIMIT=120
+
+# Momentum leaders (estilo Qulla top %)
+MOM_BARS_SHORT=42
+MOM_BARS_LONG=180
+TOP_PCT=0.08
+MIN_MOM_PCT=18
+
+# Breakout
+PRIOR_MIN_PCT=25
+BASE_BARS=12
+BASE_MAX_WIDTH_ATR=2.8
+BREAK_BUF_ATR=0.15
+RVOL_MIN=1.4
+RVOL_LEN=20
+EMA_FAST=10
+EMA_SLOW=20
+
+# Parabolic short
+PARA_UP_DAYS=5
+PARA_EXT_ATR=3.5
+PARA_MIN_MOM=40
+
+# Squeeze
+USE_SQUEEZE=true
+BB_LEN=20
+SQUEEZE_PCT=25
+
+# Filtros
+REQUIRE_BTC_ALIGN=true
+ALLOW_LONG=true
+ALLOW_SHORT=true
+MIN_QUOTE_VOL_24H=500000
+SESSION_START=0
+SESSION_END=24
+MAX_SIGNALS_DAY=8
+
+# Riesgo
+RISK_PCT=0.5
+MAX_LEV=5
+SL_ATR=1.2
+TP_R=2.5
+MAX_LOSS_STREAK=3
+MAX_DAY_LOSS_PCT=2.5
+
+STATE_PATH=/data/state.json

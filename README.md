@@ -1,0 +1,42 @@
+# Qulla Explosion Bot (BingX + Telegram + Railway)
+
+Escáner de **momentum tipo Qullamaggie** adaptado a perpetuos USDT de BingX.
+
+## Setups
+
+| Setup | Lado | Idea |
+|-------|------|------|
+| **BREAKOUT** | LONG | Leader (fuerte 7d/30d) + base estrecha sobre EMA10/20 + ruptura 15m + RVOL |
+| **PARABOLIC** | SHORT | Extensión extrema sobre EMA20 + crack (vela débil) |
+| **SQUEEZE** | L/S | Compresión Bollinger → expansión con volumen |
+
+## Modos
+
+- `MODE=SIGNAL` — solo Telegram (recomendado al inicio)
+- `MODE=PAPER` — igual + estado local
+- `MODE=LIVE` — requiere API keys; path de orden desactivado hasta configurar qty
+
+## Deploy Railway
+
+1. Sube este repo a GitHub
+2. New Project → Deploy from repo
+3. Volume opcional en `/data`
+4. Pega variables de `railway_vars.txt` (completa `TELEGRAM_*`)
+5. Start: `python bot.py` o process `worker`
+
+## Local
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+export TELEGRAM_TOKEN=... TELEGRAM_CHAT_ID=... MODE=SIGNAL
+python bot.py
+```
+
+## Notas
+
+- Qullamaggie es swing en acciones; aquí se traduce a 4h estructura + 15m entrada.
+- Win rate esperado bajo; el edge teórico está en asimetría (pocos winners grandes).
+- No garantiza beneficios. Empieza en SIGNAL y mide 2–4 semanas.
+
+Basado en reglas públicas del método de Kristjan Kullamägi (Qullamaggie): scan de líderes, base tras avance, stop estilo LOD/ATR, trail conceptual.
