@@ -75,6 +75,8 @@ class BingX:
                     [int(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])]
                 )
         out.sort(key=lambda x: x[0])
+        if not out:
+            log.debug("klines vacías %s %s", symbol, interval)
         return out
 
     async def place_market(

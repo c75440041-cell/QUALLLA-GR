@@ -288,7 +288,7 @@ async def run_cycle(bx: BingX, state: State) -> dict[str, Any]:
     except Exception:
         reg = "unknown"
 
-    # pre-rank leaders by momentum (cheap pass with struct TF)
+    # pre-rank leaders by |momentum| (incluye caídas fuertes para SHORT)
     sem = asyncio.Semaphore(settings.workers)
     mom_list: list[tuple[str, float, float]] = []
 
@@ -298,21 +298,27 @@ async def run_cycle(bx: BingX, state: State) -> dict[str, Any]:
                 kl = await bx.klines(sym, settings.tf_struct, settings.kline_limit)
             except Exception:
                 return
+        if not kl or len(kl) < 10:
+            return
         ms, ml = momentum_rank(kl, settings.mom_bars_short, settings.mom_bars_long)
-        if ms >= settings.min_mom_pct * 0.5 or abs(ms) >= settings.min_mom_pct * 0.6:
-            mom_list.append((sym, ms, ml))
+        mom_list.append((sym, ms, ml))
 
     await asyncio.gather(*[_mom(s) for s in symbols])
-    # top by abs short momentum then long
-    mom_list.sort(key=lambda x: (abs(x[1]), abs(x[2])), reverse=True)
-    n_keep = max(20, int(len(symbols) * settings.top_pct))
-    leaders = [x[0] for x in mom_list[:n_keep]]
-    # always include strong absolute movers even if negative (for shorts)
-    for sym, ms, ml in mom_list:
-        if abs(ms) >= settings.min_mom_pct and sym not in leaders:
-            leaders.append(sym)
-        if len(leaders) >= n_keep + 15:
-            break
+    if not mom_list:
+        log.warning("momentum vacío — klines sin datos útiles; usando top símbolos por orden de universo")
+        leaders = list(symbols[: max(30, int(len(symbols) * settings.top_pct))])
+    else:
+        mom_list.sort(key=lambda x: (abs(x[1]), abs(x[2])), reverse=True)
+        # log muestra
+        top3 = mom_list[:3]
+        log.info(
+            "momentum sample n=%s top=%s",
+            len(mom_list),
+            [(s, round(a, 1), round(b, 1)) for s, a, b in top3],
+        )
+        n_keep = max(30, int(len(symbols) * max(settings.top_pct, 0.12)))
+        # no exigir min_mom para entrar al ranking; el min se usa solo como boost
+        leaders = [x[0] for x in mom_list[:n_keep]]
 
     funnel = {"leaders": len(leaders), "setups": 0, "sent": 0}
     signals: list[Signal] = []
@@ -331,7 +337,7 @@ async def run_cycle(bx: BingX, state: State) -> dict[str, Any]:
             continue
         if state.data.get("signals_today", 0) >= settings.max_signals_day:
             break
-        if sig.score < 55:
+        if sig.score < 50:
             continue
         payload = {
             "symbol": sig.symbol,

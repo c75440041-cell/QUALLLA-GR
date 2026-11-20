@@ -59,7 +59,11 @@ def _rvol(v: np.ndarray, n: int = 20) -> float:
 
 
 def _ret_pct(c: np.ndarray, bars: int) -> float:
-    if len(c) <= bars or c[-bars - 1] == 0:
+    if bars < 1:
+        return 0.0
+    if len(c) <= bars:
+        bars = max(1, len(c) - 1)
+    if bars < 1 or c[-bars - 1] == 0:
         return 0.0
     return 100.0 * (c[-1] / c[-bars - 1] - 1.0)
 
